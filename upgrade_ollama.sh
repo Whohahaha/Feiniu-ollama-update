@@ -3,7 +3,7 @@
 set -e
 set -o pipefail
 
-echo "🔄 Ollama 升级脚本 for FnOS, 脚本v3.1.0"
+echo "🔄 Ollama 升级脚本 for FnOS, 脚本v3.2.0"
 
 # ─── 工具函数 ───────────────────────────────────────────────────────────────────
 
@@ -40,24 +40,106 @@ esac
 
 VER_PARAM="${OLLAMA_VERSION:+?version=$OLLAMA_VERSION}"
 
-# ─── 下载并解压函数（优先 xuc.xi-xu.me/gh 加速，回退直连；优先 zst，回退 tgz） ──────
+# ─── 镜像列表（竞速顺序）──────────────────────────────────────────────────────────
+
+# 用法：在列表中追加或删除镜像前缀即可，脚本自动竞速
+GH_MIRRORS=("https://xuc.xi-xu.me/gh" "https://ghfast.top" "https://gh.con.sh")
+
+# ─── 多源竞速下载函数 ─────────────────────────────────────────────────────────────
+#
+# race_download_file <dest_file> <url1> [url2] ...
+#   同时向所有 URL 发起下载，谁先完整写入 dest_file 就用谁，其余 kill 掉。
+#   支持断点续传（-C -）：若 dest_file 已存在则从断点继续。
+#   成功返回 0；全部失败返回 1。
+
+race_download_file() {
+    local dest="$1"; shift
+    local urls=("$@")
+    local tmp_dir
+    tmp_dir=$(mktemp -d)
+    local pids=() tmp_files=() flag_dir
+    flag_dir="$tmp_dir/done"
+    local winner_tmp=""
+
+    # 若目标文件已有部分内容则继续（断点续传）
+    local existing_size=0
+    [ -f "$dest" ] && existing_size=$(stat -c%s "$dest" 2>/dev/null || echo 0)
+
+    for i in "${!urls[@]}"; do
+        local url="${urls[$i]}"
+        local tmp_out="$tmp_dir/part_${i}"
+
+        # 若本地已有部分文件，复制一份作为续传基础
+        if [ "$existing_size" -gt 0 ]; then
+            cp "$dest" "$tmp_out" 2>/dev/null || true
+        fi
+
+        (
+            # -C - 断点续传；--retry 3 简单重试；--max-time 300
+            if curl --fail --location --silent --show-error \
+                     -C - --retry 3 --max-time 300 \
+                     -o "$tmp_out" "$url"; then
+                # 写入成功信号（文件名即 tmp 路径）
+                echo "$tmp_out" > "$flag_dir"
+            fi
+        ) &
+        pids+=($!)
+        tmp_files+=("$tmp_out")
+    done
+
+    # 轮询等待第一个成功信号（最多 300 秒）
+    local timeout=300 elapsed=0
+    while [ $elapsed -lt $timeout ]; do
+        if [ -f "$flag_dir" ]; then
+            winner_tmp=$(cat "$flag_dir")
+            break
+        fi
+        # 检查是否所有子进程都已退出（全败）
+        local all_done=1
+        for pid in "${pids[@]}"; do
+            kill -0 "$pid" 2>/dev/null && all_done=0 && break
+        done
+        [ $all_done -eq 1 ] && break
+        sleep 0.5
+        elapsed=$((elapsed + 1))
+    done
+
+    # Kill 所有剩余子进程
+    for pid in "${pids[@]}"; do
+        kill "$pid" 2>/dev/null || true
+    done
+    wait 2>/dev/null
+
+    if [ -n "$winner_tmp" ] && [ -s "$winner_tmp" ]; then
+        mv "$winner_tmp" "$dest"
+        rm -rf "$tmp_dir"
+        return 0
+    fi
+
+    rm -rf "$tmp_dir"
+    return 1
+}
+
+# ─── 下载并解压函数（多源竞速 + 断点续传） ───────────────────────────────────────
 
 download_and_extract() {
-    local url_base="$1"
+    local url_base="$1"   # 仍作兜底（ollama.com/download）
     local dest_dir="$2"
     local filename="$3"
 
-    # 将 https://ollama.com/download 转换为 GitHub releases 直链（供加速器使用）
-    # ollama.com/download 实际重定向到 github.com/ollama/ollama/releases/download/...
-    # 加速器仅支持 github.com 直链，所以需要先获取最终 URL
-    local gh_base="https://xuc.xi-xu.me/gh/ollama/ollama/releases/download/${LATEST_TAG}"
-    local direct_base="https://github.com/ollama/ollama/releases/download/${LATEST_TAG}"
+    # 构建各镜像的完整 URL 列表
+    local gh_urls=() direct_url="https://github.com/ollama/ollama/releases/download/${LATEST_TAG}"
+    for mirror in "${GH_MIRRORS[@]}"; do
+        gh_urls+=("${mirror}/ollama/ollama/releases/download/${LATEST_TAG}")
+    done
 
     # ── 尝试 .tar.zst 格式（新版 Ollama 默认）──────────────────────────────────
     local try_zst=0
-    # 先用加速地址探测 zst 是否存在
-    if curl --fail --silent --head --location "${gh_base}/${filename}.tar.zst" >/dev/null 2>&1 || \
-       curl --fail --silent --head --location "${url_base}/${filename}.tar.zst${VER_PARAM}" >/dev/null 2>&1; then
+    # 用第一个镜像或直连快速探测 zst 是否存在（HEAD 请求，不下数据）
+    if curl --fail --silent --head --location --max-time 10 \
+            "${gh_urls[0]}/${filename}.tar.zst" >/dev/null 2>&1 || \
+       curl --fail --silent --head --location --max-time 10 \
+            "${direct_url}/${filename}.tar.zst" >/dev/null 2>&1; then
         try_zst=1
     fi
 
@@ -67,34 +149,42 @@ download_and_extract() {
             echo "   apt-get install zstd  或  opkg install zstd"
             exit 1
         fi
-        echo "⬇️ 正在下载 ${filename}.tar.zst ..."
-        # 先尝试加速下载
-        if curl --fail --show-error --location --progress-bar \
-               "${gh_base}/${filename}.tar.zst" | \
-               zstd -d | tar -xf - -C "${dest_dir}" 2>/dev/null; then
-            echo "✅ 加速下载成功"
+        echo "⬇️ 正在竞速下载 ${filename}.tar.zst（${#gh_urls[@]} 镜像 + 直连同时抢跑）..."
+
+        # 构建所有候选 URL（镜像优先，直连兜底）
+        local all_urls=()
+        for base in "${gh_urls[@]}"; do all_urls+=("${base}/${filename}.tar.zst"); done
+        all_urls+=("${direct_url}/${filename}.tar.zst")
+        all_urls+=("${url_base}/${filename}.tar.zst${VER_PARAM}")
+
+        local tmp_file="${dest_dir}/${filename}.tar.zst.tmp"
+        if race_download_file "$tmp_file" "${all_urls[@]}"; then
+            echo "✅ 下载完成，开始解压..."
+            zstd -d < "$tmp_file" | tar -xf - -C "${dest_dir}"
+            rm -f "$tmp_file"
             return 0
         fi
-        echo "⚠️ 加速下载失败，回退至直连..."
-        curl --fail --show-error --location --progress-bar \
-            "${url_base}/${filename}.tar.zst${VER_PARAM}" | \
-            zstd -d | tar -xf - -C "${dest_dir}"
-        return 0
+        echo "❌ 所有源均下载失败"
+        return 1
     fi
 
     # ── 回退到 .tgz 格式（旧版兼容）──────────────────────────────────────────────
-    echo "⬇️ 正在下载 ${filename}.tgz ..."
-    # 先尝试加速下载
-    if curl --fail --show-error --location --progress-bar \
-           "${gh_base}/${filename}.tgz" | \
-           tar -xzf - -C "${dest_dir}" 2>/dev/null; then
-        echo "✅ 加速下载成功"
+    echo "⬇️ 正在竞速下载 ${filename}.tgz（${#gh_urls[@]} 镜像 + 直连同时抢跑）..."
+
+    local all_urls=()
+    for base in "${gh_urls[@]}"; do all_urls+=("${base}/${filename}.tgz"); done
+    all_urls+=("${direct_url}/${filename}.tgz")
+    all_urls+=("${url_base}/${filename}.tgz${VER_PARAM}")
+
+    local tmp_file="${dest_dir}/${filename}.tgz.tmp"
+    if race_download_file "$tmp_file" "${all_urls[@]}"; then
+        echo "✅ 下载完成，开始解压..."
+        tar -xzf "$tmp_file" -C "${dest_dir}"
+        rm -f "$tmp_file"
         return 0
     fi
-    echo "⚠️ 加速下载失败，回退至直连..."
-    curl --fail --show-error --location --progress-bar \
-        "${url_base}/${filename}.tgz${VER_PARAM}" | \
-        tar -xzf - -C "${dest_dir}"
+    echo "❌ 所有源均下载失败"
+    return 1
 }
 
 # ─── 1. 查找 Ollama 安装路径 ─────────────────────────────────────────────────────
@@ -160,21 +250,46 @@ fi
 
 # ─── 3. 获取最新版本号 ────────────────────────────────────────────────────────────
 
-echo "🌐 获取 Ollama 最新版本号（通过 xuc.xi-xu.me/gh 加速）..."
+echo "🌐 并行获取 Ollama 最新版本号（多源竞速）..."
 
-# 国内网络原因，用抓取页面方式获取，避免 GitHub API 速率限制
-# 先尝试通过加速器抓取 GitHub releases 页面，速度更快；失败则回退直连
-LATEST_TAG=$(curl -s --max-time 10 "https://xuc.xi-xu.me/gh/ollama/ollama/releases" \
-    | grep -oP '/ollama/ollama/releases/tag/\K[^"]+' | head -n 1)
+# 构建多个版本号获取 URL（包括镜像、GitHub API、页面抓取）
+_TAG_SOURCES=(
+    # GitHub 官方 API（返回 JSON，速度快）
+    "https://api.github.com/repos/ollama/ollama/releases/latest"
+    # 各镜像的 releases 页面
+    "https://xuc.xi-xu.me/gh/ollama/ollama/releases"
+    "https://ghfast.top/ollama/ollama/releases"
+    "https://gh.con.sh/ollama/ollama/releases"
+    # 直连 GitHub（作为安全底）
+    "https://github.com/ollama/ollama/releases"
+)
+
+# 并行向所有源发起请求，谁先返回有效 tag 就用谁
+_TAG_FIFO=$(mktemp -u)
+mkfifo "$_TAG_FIFO"
+_TAG_PIDS=()
+for _src in "${_TAG_SOURCES[@]}"; do
+    (
+        _raw=$(curl -s --max-time 15 --location "$_src" 2>/dev/null)
+        # GitHub API 返回 JSON，用 tag_name 字段
+        _tag=$(echo "$_raw" | grep -oP '"tag_name":\s*"\K[^"]+' | head -n1)
+        # 页面抓取方式（镜像页/GitHub releases）
+        [ -z "$_tag" ] && _tag=$(echo "$_raw" | grep -oP '/ollama/ollama/releases/tag/\K[^"]+' | head -n1)
+        [ -n "$_tag" ] && echo "$_tag" > "$_TAG_FIFO"
+    ) &
+    _TAG_PIDS+=($!)
+done
+
+# 读取第一个有效结果（跭时 15s）
+LATEST_TAG=$(timeout 15 cat "$_TAG_FIFO" 2>/dev/null | head -n1)
+
+# 清理：kill 剪余子进程，删除 FIFO
+for _p in "${_TAG_PIDS[@]}"; do kill "$_p" 2>/dev/null || true; done
+wait 2>/dev/null
+rm -f "$_TAG_FIFO"
 
 if [ -z "$LATEST_TAG" ]; then
-    echo "⚠️ 加速节点获取失败，回退至直连 GitHub..."
-    LATEST_TAG=$(curl -s "https://github.com/ollama/ollama/releases" \
-        | grep -oP '/ollama/ollama/releases/tag/\K[^"]+' | head -n 1)
-fi
-
-if [ -z "$LATEST_TAG" ]; then
-    echo "❌ 无法从 GitHub 获取 Ollama 最新版本号，请检查网络连接或代理设置"
+    echo "❌ 无法从任何源获取 Ollama 最新版本号，请检查网络连接或代理设置"
     exit 1
 fi
 
