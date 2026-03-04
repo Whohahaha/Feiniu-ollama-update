@@ -3,7 +3,7 @@
 set -e
 set -o pipefail
 
-echo "🔄 Ollama 升级脚本 for FnOS, 脚本v3.0.0"
+echo "🔄 Ollama 升级脚本 for FnOS, 脚本v3.1.0"
 
 # ─── 工具函数 ───────────────────────────────────────────────────────────────────
 
@@ -40,30 +40,58 @@ esac
 
 VER_PARAM="${OLLAMA_VERSION:+?version=$OLLAMA_VERSION}"
 
-# ─── 下载并解压函数（参考官方脚本，优先 zst，回退 tgz） ─────────────────────────
+# ─── 下载并解压函数（优先 xuc.xi-xu.me/gh 加速，回退直连；优先 zst，回退 tgz） ──────
 
 download_and_extract() {
     local url_base="$1"
     local dest_dir="$2"
     local filename="$3"
 
-    # 检查是否有 .tar.zst 格式（新版 Ollama 默认）
-    if curl --fail --silent --head --location "${url_base}/${filename}.tar.zst${VER_PARAM}" >/dev/null 2>&1; then
-        # 有 zst 文件，检查 zstd 工具
+    # 将 https://ollama.com/download 转换为 GitHub releases 直链（供加速器使用）
+    # ollama.com/download 实际重定向到 github.com/ollama/ollama/releases/download/...
+    # 加速器仅支持 github.com 直链，所以需要先获取最终 URL
+    local gh_base="https://xuc.xi-xu.me/gh/ollama/ollama/releases/download/${LATEST_TAG}"
+    local direct_base="https://github.com/ollama/ollama/releases/download/${LATEST_TAG}"
+
+    # ── 尝试 .tar.zst 格式（新版 Ollama 默认）──────────────────────────────────
+    local try_zst=0
+    # 先用加速地址探测 zst 是否存在
+    if curl --fail --silent --head --location "${gh_base}/${filename}.tar.zst" >/dev/null 2>&1 || \
+       curl --fail --silent --head --location "${url_base}/${filename}.tar.zst${VER_PARAM}" >/dev/null 2>&1; then
+        try_zst=1
+    fi
+
+    if [ "$try_zst" -eq 1 ]; then
         if ! available zstd; then
             echo "❌ 此版本需要 zstd 解压工具，请先安装："
             echo "   apt-get install zstd  或  opkg install zstd"
             exit 1
         fi
         echo "⬇️ 正在下载 ${filename}.tar.zst ..."
+        # 先尝试加速下载
+        if curl --fail --show-error --location --progress-bar \
+               "${gh_base}/${filename}.tar.zst" | \
+               zstd -d | tar -xf - -C "${dest_dir}" 2>/dev/null; then
+            echo "✅ 加速下载成功"
+            return 0
+        fi
+        echo "⚠️ 加速下载失败，回退至直连..."
         curl --fail --show-error --location --progress-bar \
             "${url_base}/${filename}.tar.zst${VER_PARAM}" | \
             zstd -d | tar -xf - -C "${dest_dir}"
         return 0
     fi
 
-    # 回退到 .tgz 格式（旧版兼容）
+    # ── 回退到 .tgz 格式（旧版兼容）──────────────────────────────────────────────
     echo "⬇️ 正在下载 ${filename}.tgz ..."
+    # 先尝试加速下载
+    if curl --fail --show-error --location --progress-bar \
+           "${gh_base}/${filename}.tgz" | \
+           tar -xzf - -C "${dest_dir}" 2>/dev/null; then
+        echo "✅ 加速下载成功"
+        return 0
+    fi
+    echo "⚠️ 加速下载失败，回退至直连..."
     curl --fail --show-error --location --progress-bar \
         "${url_base}/${filename}.tgz${VER_PARAM}" | \
         tar -xzf - -C "${dest_dir}"
@@ -132,10 +160,18 @@ fi
 
 # ─── 3. 获取最新版本号 ────────────────────────────────────────────────────────────
 
-echo "🌐 获取 Ollama 最新版本号..."
+echo "🌐 获取 Ollama 最新版本号（通过 xuc.xi-xu.me/gh 加速）..."
 
 # 国内网络原因，用抓取页面方式获取，避免 GitHub API 速率限制
-LATEST_TAG=$(curl -s https://github.com/ollama/ollama/releases | grep -oP '/ollama/ollama/releases/tag/\K[^"]+' | head -n 1)
+# 先尝试通过加速器抓取 GitHub releases 页面，速度更快；失败则回退直连
+LATEST_TAG=$(curl -s --max-time 10 "https://xuc.xi-xu.me/gh/ollama/ollama/releases" \
+    | grep -oP '/ollama/ollama/releases/tag/\K[^"]+' | head -n 1)
+
+if [ -z "$LATEST_TAG" ]; then
+    echo "⚠️ 加速节点获取失败，回退至直连 GitHub..."
+    LATEST_TAG=$(curl -s "https://github.com/ollama/ollama/releases" \
+        | grep -oP '/ollama/ollama/releases/tag/\K[^"]+' | head -n 1)
+fi
 
 if [ -z "$LATEST_TAG" ]; then
     echo "❌ 无法从 GitHub 获取 Ollama 最新版本号，请检查网络连接或代理设置"
